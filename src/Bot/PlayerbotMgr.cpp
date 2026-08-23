@@ -89,8 +89,8 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
     // Nothing may start logging in once the world is going away. A bot that
     // completes its load during shutdown runs LoadFromDB against a Player the
     // shutdown has already finalised, and Unit::_AddAura asserts on
-    // !m_cleanupDone. Priests in a battleground hit it every time, because the
-    // battleground branch of LoadFromDB resurrects them, and resurrecting
+    // !m_cleanupDone. Bots saved dead in a battleground hit it, because that
+    // branch of LoadFromDB resurrects them before relocating, and resurrecting
     // applies auras.
     if (World::IsStopped())
         return;

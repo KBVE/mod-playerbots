@@ -25,6 +25,8 @@
 
 #include "BattlegroundMgr.h"
 #include "CharacterCache.h"
+#include "DBCStores.h"
+#include "InstanceSaveMgr.h"
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Log.h"
@@ -162,6 +164,10 @@ namespace
     struct ClusterPendingAnchor
     {
         ObjectGuid::LowType groupLow;
+        // Whose instance the bots belong in. TeleportTo takes no instance, so
+        // without binding to this player's save first every bot resolves its
+        // own copy of the dungeon and the master arrives alone.
+        ObjectGuid::LowType anchorLow;
         uint32 mapId;
         uint32 instanceId;
         float x, y, z, o;
@@ -227,6 +233,7 @@ namespace
 
         ClusterPendingAnchor pending;
         pending.groupLow = group->GetGUID().GetCounter();
+        pending.anchorLow = anchor->GetGUID().GetCounter();
         pending.mapId = anchor->GetMapId();
         pending.instanceId = anchor->GetInstanceId();
         pending.x = anchor->GetPositionX();
@@ -265,12 +272,13 @@ namespace
     void OnClusterGroupAnchor(char const* /*subject*/, char const* payload, int payloadLen)
     {
         uint32 groupLow = 0;
+        uint32 anchorLow = 0;
         uint32 mapId = 0;
         uint32 instanceId = 0;
         float x = 0.f, y = 0.f, z = 0.f, o = 0.f;
         std::string data(payload, payloadLen);
-        if (sscanf(data.c_str(), "{\"gg\":%u,\"m\":%u,\"i\":%u,\"x\":%f,\"y\":%f,\"z\":%f,\"o\":%f}",
-                   &groupLow, &mapId, &instanceId, &x, &y, &z, &o) != 7)
+        if (sscanf(data.c_str(), "{\"gg\":%u,\"a\":%u,\"m\":%u,\"i\":%u,\"x\":%f,\"y\":%f,\"z\":%f,\"o\":%f}",
+                   &groupLow, &anchorLow, &mapId, &instanceId, &x, &y, &z, &o) != 8)
             return;
 
         if (!sPlayerbotAIConfig.enabled)
@@ -278,6 +286,7 @@ namespace
 
         ClusterPendingAnchor pending;
         pending.groupLow = groupLow;
+        pending.anchorLow = anchorLow;
         pending.mapId = mapId;
         pending.instanceId = instanceId;
         pending.x = x;
@@ -989,6 +998,7 @@ private:
             if (anchor.publish)
             {
                 std::string payload = "{\"gg\":" + std::to_string(anchor.groupLow) +
+                                      ",\"a\":" + std::to_string(anchor.anchorLow) +
                                       ",\"m\":" + std::to_string(anchor.mapId) +
                                       ",\"i\":" + std::to_string(anchor.instanceId);
                 char pos[96];
@@ -1037,6 +1047,22 @@ private:
 
             if (bot->GetMapId() == anchor.mapId && bot->GetInstanceId() == anchor.instanceId)
                 continue;
+
+            // TeleportTo carries no instance, so bind the bot to the anchor's
+            // save first -- otherwise the map is right, the copy is not, and
+            // the master stands in an empty dungeon while the bots fight in
+            // their own. Only possible while the anchor's save lives in this
+            // process; across shards the instance cannot be shared at all.
+            if (anchor.instanceId && anchor.anchorLow)
+            {
+                ObjectGuid const anchorGuid = ObjectGuid::Create<HighGuid::Player>(anchor.anchorLow);
+                MapEntry const* mapEntry = sMapStore.LookupEntry(anchor.mapId);
+                Difficulty const difficulty = (mapEntry && mapEntry->IsRaid())
+                    ? bot->GetRaidDifficulty() : bot->GetDungeonDifficulty();
+
+                if (InstanceSave* save = sInstanceSaveMgr->PlayerGetInstanceSave(anchorGuid, anchor.mapId, difficulty))
+                    sInstanceSaveMgr->PlayerBindToInstance(bot->GetGUID(), save, false, bot);
+            }
 
             LOG_INFO("playerbots", "Cluster: group anchor moves bot {} to map {} instance {}",
                      bot->GetName(), anchor.mapId, anchor.instanceId);

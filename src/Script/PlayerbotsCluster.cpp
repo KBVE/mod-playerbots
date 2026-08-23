@@ -166,6 +166,13 @@ namespace
         uint32 instanceId;
         float x, y, z, o;
         bool publish;
+        // The roster travels WITH the anchor. A group formed inside a
+        // worldserver (every LFG party) was never registered with the group
+        // service, so no other shard has it and a GetGroupByGUID lookup on the
+        // receiving side finds nothing -- the message was published into the
+        // void and the bots never came. Carrying the members makes delivery
+        // independent of whether the group was mirrored.
+        std::vector<ObjectGuid::LowType> members;
     };
 
     // Fed from map-update worker threads (OnMapChanged), drained on the world
@@ -227,6 +234,8 @@ namespace
         pending.z = anchor->GetPositionZ();
         pending.o = anchor->GetOrientation();
         pending.publish = publish;
+        for (auto const& slot : group->GetMemberSlots())
+            pending.members.push_back(slot.guid.GetCounter());
 
         std::lock_guard<std::mutex> lock(clusterPendingAnchorMutex);
         for (ClusterPendingAnchor& existing : clusterPendingAnchors)
@@ -267,12 +276,6 @@ namespace
         if (!sPlayerbotAIConfig.enabled)
             return;
 
-        // Only shards that host part of this group do anything; everyone else
-        // has no such group and drops the message.
-        Group* group = sGroupMgr->GetGroupByGUID(groupLow);
-        if (!group)
-            return;
-
         ClusterPendingAnchor pending;
         pending.groupLow = groupLow;
         pending.mapId = mapId;
@@ -282,6 +285,28 @@ namespace
         pending.z = z;
         pending.o = o;
         pending.publish = false;
+
+        // Deliberately no GetGroupByGUID guard: an LFG group exists only in
+        // the worldserver that built it, so requiring a local group here threw
+        // the message away on exactly the shards holding the bots.
+        if (size_t const memPos = data.find("\"mem\":"); memPos != std::string::npos)
+        {
+            char const* cursor = data.c_str() + memPos + 6;
+            while (*cursor)
+            {
+                char* end = nullptr;
+                unsigned long const guid = strtoul(cursor, &end, 10);
+                if (end == cursor)
+                    break;
+
+                if (guid)
+                    pending.members.push_back(ObjectGuid::LowType(guid));
+
+                cursor = (*end == ',') ? end + 1 : end;
+                if (*end != ',')
+                    break;
+            }
+        }
 
         std::lock_guard<std::mutex> lock(clusterPendingAnchorMutex);
         clusterPendingAnchors.push_back(pending);
@@ -960,17 +985,22 @@ private:
         for (ClusterPendingAnchor const& anchor : anchors)
         {
             Group* group = sGroupMgr->GetGroupByGUID(anchor.groupLow);
-            if (!group)
-                continue;
 
             if (anchor.publish)
             {
-                char payload[224];
-                int len = snprintf(payload, sizeof(payload),
-                                   "{\"gg\":%u,\"m\":%u,\"i\":%u,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"o\":%.3f}",
-                                   anchor.groupLow, anchor.mapId, anchor.instanceId,
-                                   anchor.x, anchor.y, anchor.z, anchor.o);
-                sToCloud9Sidecar->NatsPublish(CLUSTER_GROUP_ANCHOR_SUBJECT, std::string(payload, len));
+                std::string payload = "{\"gg\":" + std::to_string(anchor.groupLow) +
+                                      ",\"m\":" + std::to_string(anchor.mapId) +
+                                      ",\"i\":" + std::to_string(anchor.instanceId);
+                char pos[96];
+                snprintf(pos, sizeof(pos), ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"o\":%.3f",
+                         anchor.x, anchor.y, anchor.z, anchor.o);
+                payload += pos;
+                payload += ",\"mem\":";
+                for (size_t i = 0; i < anchor.members.size(); ++i)
+                    payload += (i ? "," : "") + std::to_string(anchor.members[i]);
+                payload += "}";
+
+                sToCloud9Sidecar->NatsPublish(CLUSTER_GROUP_ANCHOR_SUBJECT, payload);
             }
 
             MoveLocalGroupBots(group, anchor);
@@ -983,24 +1013,28 @@ private:
     // this shard owns to wherever the anchor ended up.
     void MoveLocalGroupBots(Group* group, ClusterPendingAnchor const& anchor)
     {
-        Player* localAnchor = FindLocalGroupAnchor(group);
+        // Prefer the roster carried by the anchor: on a shard that never saw
+        // the group created, it is the only member list available. Fall back
+        // to the local group for anchors raised in this process.
+        std::vector<ObjectGuid::LowType> members = anchor.members;
+        if (members.empty() && group)
+            for (auto const& slot : group->GetMemberSlots())
+                members.push_back(slot.guid.GetCounter());
 
-        for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+        Player* localAnchor = group ? FindLocalGroupAnchor(group) : nullptr;
+
+        for (ObjectGuid::LowType memberLow : members)
         {
-            Player* bot = itr->GetSource();
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(memberLow));
             if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
-                continue;
-
-            if (localAnchor)
-                BindBotToAnchor(bot, localAnchor, group);
+                continue;  // not in this process, or a real player
 
             if (bot->InBattleground())
                 continue;  // BG participants stay with their match (C-BG.5)
 
-            // Same map AND same instance means the bot is already with the
-            // anchor; the follow strategy walks the rest. Instance has to be
-            // part of the test or a bot in its own copy of a dungeon looks
-            // like it arrived.
+            if (localAnchor && group)
+                BindBotToAnchor(bot, localAnchor, group);
+
             if (bot->GetMapId() == anchor.mapId && bot->GetInstanceId() == anchor.instanceId)
                 continue;
 

@@ -51,6 +51,13 @@
 namespace
 {
     constexpr char CLUSTER_LOGIN_REQUEST_SUBJECT[] = "playerbots.login-request";
+    // Asks whichever shard currently hosts a grouped bot to send it to its
+    // master. The partition keeps a bot on the shard owning the map it is
+    // saved on, which is not necessarily the shard hosting the player who
+    // grouped it: the group forms over NATS, but the bot then sits in another
+    // process and can neither be seen nor followed. Carries the master's
+    // position so the receiving shard can teleport the bot onto it.
+    constexpr char CLUSTER_GROUP_FOLLOW_SUBJECT[] = "playerbots.group-follow";
     constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
     constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
     constexpr char GROUP_MESSAGE_NEW_SUBJECT[] = "group.message.new";
@@ -129,6 +136,48 @@ namespace
                 return;
 
         clusterPendingLogins.push_back({guidLow, mapId, int32(CLUSTER_LOGIN_DELAY_MS)});
+    }
+
+    // Runs on the world thread (delivered through ProcessHooks), same as the
+    // login request above.
+    //
+    // A bot grouped by a player on another shard is invisible to that player:
+    // the group forms over NATS, but the bot stays in the process owning the
+    // map it is saved on. This teleports it onto its master instead of trying
+    // to move it between shards directly -- the destination map belongs to the
+    // master's shard, so the existing partition path (OnPlayerUpdateZone ->
+    // ProcessPendingKicks -> handoff) picks the bot up and delivers it there,
+    // and because the logout saves the new position it loads next to its
+    // master rather than back where it started. One transport, not two.
+    void OnClusterGroupFollow(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        uint32 guidLow = 0;
+        uint32 mapId = 0;
+        float x = 0.f, y = 0.f, z = 0.f, o = 0.f;
+        std::string data(payload, payloadLen);
+        if (sscanf(data.c_str(), "{\"g\":%u,\"m\":%u,\"x\":%f,\"y\":%f,\"z\":%f,\"o\":%f}",
+                   &guidLow, &mapId, &x, &y, &z, &o) != 6)
+            return;
+
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        // Only the shard actually holding the bot does anything; everyone else
+        // ignores the message.
+        Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidLow));
+        if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+            return;
+
+        if (bot->GetMapId() == mapId)
+            return;  // already on the master's map, nothing to do
+
+        if (bot->InBattleground())
+            return;  // BG participants stay with their match (C-BG.5)
+
+        LOG_INFO("playerbots", "Cluster: sending grouped bot {} to its master on map {}",
+                 bot->GetName(), mapId);
+
+        bot->TeleportTo(mapId, x, y, z, o);
     }
 
     // Minimal extractor for one numeric field of the groupserver JSON events
@@ -727,6 +776,7 @@ public:
         if (!clusterSubscribed && sPlayerbotAIConfig.enabled)
             clusterSubscribed =
                 sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest) &&
+                sToCloud9Sidecar->NatsSubscribe(CLUSTER_GROUP_FOLLOW_SUBJECT, &OnClusterGroupFollow) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage) &&
@@ -793,7 +843,16 @@ private:
 
             clusterKickCooldowns[guid.GetCounter()] = int32(CLUSTER_KICK_COOLDOWN_MS);
 
-            if (IsMapServedByClusterBots(mapId))
+            // A grouped bot is always handed off, never re-randomized. It got
+            // here by following its master -- through the area trigger relay
+            // into a dungeon, most often -- and instance maps are not in
+            // ClusterBotMaps, so the re-randomize branch below would drag it
+            // back to its grind continent the moment the group zoned in. The
+            // shard owning the destination accepts the handoff regardless of
+            // whether it hosts a bot pool for that map.
+            bool const followingMaster = bot->GetGroup() != nullptr;
+
+            if (followingMaster || IsMapServedByClusterBots(mapId))
             {
                 // Logout first so the receiving worldserver loads the
                 // position saved on the destination map.
@@ -1015,7 +1074,31 @@ public:
             return;
 
         Player* bot = ObjectAccessor::FindPlayer(guid);
-        if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+
+        // The bot is not in this process. If WE host the group leader, it is
+        // on another shard and cannot see or follow them -- ask whoever holds
+        // it to send it over. Without this the group forms (member.added
+        // reaches every shard over NATS) but the player is left alone, which
+        // is indistinguishable from the bots simply not working.
+        if (!bot)
+        {
+            Player* remoteLeader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
+            if (!remoteLeader || GET_PLAYERBOT_AI(remoteLeader))
+                return;  // leader is elsewhere too, or is itself a bot
+
+            char payload[160];
+            int len = snprintf(payload, sizeof(payload),
+                               "{\"g\":%u,\"m\":%u,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"o\":%.3f}",
+                               guid.GetCounter(), remoteLeader->GetMapId(),
+                               remoteLeader->GetPositionX(), remoteLeader->GetPositionY(),
+                               remoteLeader->GetPositionZ(), remoteLeader->GetOrientation());
+            LOG_INFO("playerbots", "Cluster: requesting off-shard bot {} join {} on map {}",
+                     guid.GetCounter(), remoteLeader->GetName(), remoteLeader->GetMapId());
+            sToCloud9Sidecar->NatsPublish(CLUSTER_GROUP_FOLLOW_SUBJECT, std::string(payload, len));
+            return;
+        }
+
+        if (!bot->GetSession() || !bot->GetSession()->IsBot())
             return;
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
@@ -1023,8 +1106,7 @@ public:
             return;
 
         // Only obey a real player hosted on this shard: bot-led groups keep
-        // the vanilla behavior, and a cross-shard leader has no local Player
-        // to follow anyway.
+        // the vanilla behavior. A cross-shard leader is handled above.
         Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
         if (!leader || leader == bot || GET_PLAYERBOT_AI(leader))
             return;

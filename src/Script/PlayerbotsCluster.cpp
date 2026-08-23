@@ -1047,23 +1047,54 @@ private:
             // alone in dungeons -- the group anchor delivered the bot and
             // this loop threw it straight back out.
             //
-            // Map only, deliberately NOT instance: TeleportTo is asynchronous,
-            // so a bot arriving in a dungeon reports the destination map while
-            // its instance id is still the old one. Comparing instances here
-            // lost that race every time and exiled the whole party. A wrong
-            // instance is corrected by teleporting the bot to its master
-            // (below), never by shipping it to another shard.
+            // Position is deliberately NOT compared. Both earlier attempts
+            // (instance equality, then map equality) tried to prove the bot
+            // was already beside its master, and both lost the same race:
+            // LFGMgr teleports members out of an unordered set and TeleportTo
+            // is asynchronous, so a bot reaches the dungeon and fires its zone
+            // update while the player is still in flight. The partition then
+            // evicted the party a moment before the master landed.
+            //
+            // A grouped bot follows its master, not the partition -- the same
+            // rule the alt-bot check above already applies. Where the group
+            // should be is the anchor's business; this loop only decides where
+            // UNGROUPED bots may grind.
             if (Group* group = bot->GetGroup())
             {
-                if (Player* anchor = FindLocalGroupAnchor(group))
+                bool groupHasRealPlayer = false;
+                for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                 {
-                    if (anchor->GetMapId() == mapId)
+                    Player* member = itr->GetSource();
+                    if (member && member->GetSession() && !member->GetSession()->IsBot())
                     {
-                        if (anchor->GetInstanceId() != bot->GetInstanceId())
+                        groupHasRealPlayer = true;
+                        break;
+                    }
+                }
+
+                // Members hosted on other shards have no local Player, so fall
+                // back to the roster: anyone the bot pool does not own is a
+                // real player as far as this decision goes.
+                if (!groupHasRealPlayer)
+                {
+                    for (auto const& slot : group->GetMemberSlots())
+                    {
+                        if (!sRandomPlayerbotMgr.IsRandomBot(slot.guid.GetCounter()))
+                        {
+                            groupHasRealPlayer = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (groupHasRealPlayer)
+                {
+                    if (Player* anchor = FindLocalGroupAnchor(group))
+                        if (anchor->GetMapId() != bot->GetMapId() ||
+                            anchor->GetInstanceId() != bot->GetInstanceId())
                             QueueGroupAnchor(group, anchor, false);
 
-                        continue;
-                    }
+                    continue;
                 }
             }
 

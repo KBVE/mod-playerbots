@@ -831,7 +831,7 @@ public:
     // instance alone. Record the anchor; the world thread does the work.
     //
     // May run on map-update worker threads: only collect, never act here.
-    void OnMapChanged(Player* player) override
+    void OnPlayerMapChanged(Player* player) override
     {
         if (!sToCloud9Sidecar->ClusterModeEnabled() || !sPlayerbotAIConfig.enabled)
             return;

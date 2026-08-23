@@ -1038,6 +1038,19 @@ private:
             if (bot->InBattleground())
                 continue;  // BG participants stay with their match (C-BG.5)
 
+            // Never evict a bot that is standing with its master. The
+            // partition governs where bots GRIND, not where a group may be:
+            // a dungeon map belongs to the instance shard, but a real player
+            // entering it is not partitioned and stays in whichever process
+            // they were already in. The bot followed them there correctly,
+            // and kicking it off the master's own map is what left players
+            // alone in dungeons -- the group anchor delivered the bot and
+            // this loop threw it straight back out.
+            if (Group* group = bot->GetGroup())
+                if (Player* anchor = FindLocalGroupAnchor(group))
+                    if (anchor->GetMapId() == mapId && anchor->GetInstanceId() == bot->GetInstanceId())
+                        continue;
+
             clusterKickCooldowns[guid.GetCounter()] = int32(CLUSTER_KICK_COOLDOWN_MS);
 
             // A grouped bot is always handed off, never re-randomized. It got

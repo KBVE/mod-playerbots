@@ -1046,10 +1046,26 @@ private:
             // and kicking it off the master's own map is what left players
             // alone in dungeons -- the group anchor delivered the bot and
             // this loop threw it straight back out.
+            //
+            // Map only, deliberately NOT instance: TeleportTo is asynchronous,
+            // so a bot arriving in a dungeon reports the destination map while
+            // its instance id is still the old one. Comparing instances here
+            // lost that race every time and exiled the whole party. A wrong
+            // instance is corrected by teleporting the bot to its master
+            // (below), never by shipping it to another shard.
             if (Group* group = bot->GetGroup())
+            {
                 if (Player* anchor = FindLocalGroupAnchor(group))
-                    if (anchor->GetMapId() == mapId && anchor->GetInstanceId() == bot->GetInstanceId())
+                {
+                    if (anchor->GetMapId() == mapId)
+                    {
+                        if (anchor->GetInstanceId() != bot->GetInstanceId())
+                            QueueGroupAnchor(group, anchor, false);
+
                         continue;
+                    }
+                }
+            }
 
             clusterKickCooldowns[guid.GetCounter()] = int32(CLUSTER_KICK_COOLDOWN_MS);
 

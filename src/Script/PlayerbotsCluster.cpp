@@ -1150,11 +1150,25 @@ private:
                 if (groupHasRealPlayer)
                 {
                     if (Player* anchor = FindLocalGroupAnchor(group))
+                    {
+                        // Master is here, so the anchor decides where the bot
+                        // goes and the partition must keep its hands off.
                         if (anchor->GetMapId() != bot->GetMapId() ||
                             anchor->GetInstanceId() != bot->GetInstanceId())
                             QueueGroupAnchor(group, anchor, false);
 
-                    continue;
+                        continue;
+                    }
+
+                    // No local anchor means the master is on another shard, and
+                    // the bot has already teleported onto a map this one does
+                    // not own -- its own private copy of the master's dungeon,
+                    // which the master can never see. Exempting it here strands
+                    // it there forever, because the handoff below is the only
+                    // thing that can deliver it to the shard actually running
+                    // that instance. Fall through: the followingMaster branch
+                    // already hands grouped bots off rather than
+                    // re-randomizing them.
                 }
             }
 

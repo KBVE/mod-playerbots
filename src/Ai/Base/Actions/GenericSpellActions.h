@@ -474,6 +474,19 @@ public:
     CastBladeSalvoAction(PlayerbotAI* botAI) : CastVehicleSpellAction(botAI, "blade salvo") {}
 };
 
+/// Fires whatever offensive spell the ridden vehicle actually carries, so bots crew vehicles the AI has no named action for.
+class CastVehicleAttackAction : public CastVehicleSpellAction
+{
+public:
+    CastVehicleAttackAction(PlayerbotAI* botAI) : CastVehicleSpellAction(botAI, "vehicle attack") {}
+
+    bool Execute(Event event) override;
+    bool isPossible() override;
+
+private:
+    uint32 PickSpell();
+};
+
 class MainTankActionNameSupport
 {
 public:

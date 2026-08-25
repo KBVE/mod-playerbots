@@ -88,6 +88,15 @@ AiPlayerbot.RandomBotAutologin = 1
 AiPlayerbot.MinRandomBots = 500
 AiPlayerbot.MaxRandomBots = 500
 
+#    AiPlayerbot.LfgMinEquippedItems
+#        Minimum number of EQUIPPED items a bot must have before it will queue
+#        for the dungeon finder. Bots whose gear is sitting in the backpack with
+#        empty equipment slots are otherwise offered to players as tanks and
+#        healers. A geared level 80 wears 16-19 items; 0 disables the check.
+#        Default: 10
+
+AiPlayerbot.LfgMinEquippedItems = 10
+
 #    AiPlayerbot.ClusterTotalRandomBots
 #        Total random bots across ALL worldservers sharing one playerbots
 #        database. Only used to size the shared account pool; the number of

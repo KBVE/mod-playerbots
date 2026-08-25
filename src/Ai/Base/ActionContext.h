@@ -241,6 +241,7 @@ public:
         creators["rocket blast"] = &ActionContext::rocket_blast;
         creators["blade salvo"] = &ActionContext::blade_salvo;
         creators["glaive throw"] = &ActionContext::glaive_throw;
+        creators["vehicle attack"] = &ActionContext::vehicle_attack;
 
         //Rpg
         creators["rpg stay"] = &ActionContext::rpg_stay;
@@ -446,6 +447,7 @@ private:
     static Action* fire_cannon(PlayerbotAI* botAI) { return new CastFireCannonAction(botAI); }
     static Action* incendiary_rocket(PlayerbotAI* botAI) { return new CastIncendiaryRocketAction(botAI); }
     static Action* rocket_blast(PlayerbotAI* botAI) { return new CastRocketBlastAction(botAI); }
+    static Action* vehicle_attack(PlayerbotAI* botAI) { return new CastVehicleAttackAction(botAI); }
     static Action* glaive_throw(PlayerbotAI* botAI) { return new CastGlaiveThrowAction(botAI); }
     static Action* blade_salvo(PlayerbotAI* botAI) { return new CastBladeSalvoAction(botAI); }
 

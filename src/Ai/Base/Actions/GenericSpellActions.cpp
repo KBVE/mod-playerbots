@@ -21,6 +21,8 @@
 #include "Chat.h"
 #include "GenericBuffUtils.h"
 #include "PlayerbotAI.h"
+#include "Vehicle.h"
+#include "Creature.h"
 
 using ai::buff::MakeAuraQualifierForBuff;
 using ai::spell::HasSpellOrCategoryCooldown;
@@ -491,6 +493,53 @@ bool CastVehicleSpellAction::isPossible()
 }
 
 bool CastVehicleSpellAction::isUseful() { return botAI->IsInVehicle(false, true); }
+
+uint32 CastVehicleAttackAction::PickSpell()
+{
+    Vehicle* vehicle = bot->GetVehicle();
+    if (!vehicle)
+        return 0;
+
+    VehicleSeatEntry const* seat = vehicle->GetSeatForPassenger(bot);
+    if (!seat || !(seat->m_flags & VEHICLE_SEAT_FLAG_CAN_CAST))
+        return 0;
+
+    Unit* vehicleBase = vehicle->GetBase();
+    if (!vehicleBase || !vehicleBase->IsAlive())
+        return 0;
+
+    Creature* creature = vehicleBase->ToCreature();
+    if (!creature)
+        return 0;
+
+    Unit* target = GetTarget();
+    if (!target)
+        return 0;
+
+    for (uint32 x = 0; x < MAX_CREATURE_SPELLS; ++x)
+    {
+        uint32 spellId = creature->m_spells[x];
+        if (!spellId || spellId == 2)
+            continue;
+
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo || spellInfo->IsPassive() || spellInfo->IsPositive())
+            continue;
+
+        if (botAI->CanCastVehicleSpell(spellId, target))
+            return spellId;
+    }
+
+    return 0;
+}
+
+bool CastVehicleAttackAction::isPossible() { return PickSpell() != 0; }
+
+bool CastVehicleAttackAction::Execute(Event /*event*/)
+{
+    uint32 spellId = PickSpell();
+    return spellId && botAI->CastVehicleSpell(spellId, GetTarget());
+}
 
 bool CastVehicleSpellAction::Execute(Event /*event*/)
 {

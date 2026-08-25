@@ -35,6 +35,7 @@
 #include "RandomPlayerbotMgr.h"
 #include "SharedDefines.h"
 #include "TC9Sidecar.h"
+#include "World.h"
 #include "WorldSession.h"
 #include "BroadcastHelper.h"
 #include "WorldSessionMgr.h"
@@ -85,6 +86,15 @@ public:
 
 void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId)
 {
+    // Nothing may start logging in once the world is going away. A bot that
+    // completes its load during shutdown runs LoadFromDB against a Player the
+    // shutdown has already finalised, and Unit::_AddAura asserts on
+    // !m_cleanupDone. Bots saved dead in a battleground hit it, because that
+    // branch of LoadFromDB resurrects them before relocating, and resurrecting
+    // applies auras.
+    if (World::IsStopped())
+        return;
+
     if (botLoading.find(playerGuid) != botLoading.end())
         return;
 
@@ -199,6 +209,15 @@ bool PlayerbotHolder::IsAccountLinked(uint32 accountId, uint32 linkedAccountId)
 
 void PlayerbotHolder::HandlePlayerBotLoginCallback(PlayerbotLoginQueryHolder const& holder)
 {
+    // The guard in AddPlayerBot cannot catch a load that was already in flight
+    // when shutdown began; this is where those land. Drop it rather than build
+    // a session the world is about to tear down.
+    if (World::IsStopped())
+    {
+        PlayerbotHolder::botLoading.erase(holder.GetGuid());
+        return;
+    }
+
     uint32 botAccountId = holder.GetAccountId();
     // At login DBC locale should be what the server is set to use by default (as spells etc are hardcoded to ENUS this
     // allows channels to work as intended)

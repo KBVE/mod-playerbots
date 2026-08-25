@@ -546,7 +546,16 @@ void RandomPlayerbotMgr::AssignAccountTypes()
     if (sPlayerbotAIConfig.maxRandomBots > 0)
     {
         int divisor = RandomPlayerbotFactory::CalculateAvailableCharsPerAccount();
-        int maxBots = sPlayerbotAIConfig.maxRandomBots;
+        // playerbots_account_type is shared by every worldserver in a cluster,
+        // but this sizing runs per-server. Each shard therefore only ever asks
+        // for its own population, and because accounts are added and never
+        // demoted the pool settles at the largest single shard rather than the
+        // sum -- two shards of 2000 produce ~200 accounts, enough for 2000 bots
+        // in total instead of 2000 each. ClusterTotalRandomBots lets every shard
+        // size the shared pool for the whole fleet; the login target below still
+        // comes from Min/MaxRandomBots, so a shard does not try to seat the
+        // fleet's bots.
+        int maxBots = int(sPlayerbotAIConfig.GetBotPoolSizingTarget());
 
         // Take periodic online-offline into account
         if (sPlayerbotAIConfig.enablePeriodicOnlineOffline)

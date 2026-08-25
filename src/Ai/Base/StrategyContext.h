@@ -8,6 +8,7 @@
 #define PLAYERBOTS_STRATEGYCONTEXT_H
 
 #include "AggressiveStrategy.h"
+#include "VehicleCombatStrategy.h"
 #include "AttackEnemyPlayersStrategy.h"
 #include "BattlegroundStrategy.h"
 #include "CastTimeStrategy.h"
@@ -107,6 +108,7 @@ public:
         creators["arathi"] = &StrategyContext::arathi;
         creators["eye"] = &StrategyContext::eye;
         creators["isle"] = &StrategyContext::isle;
+        creators["vehicle combat"] = &StrategyContext::vehicle_combat;
         creators["arena"] = &StrategyContext::arena;
         creators["mount"] = &StrategyContext::mount;
         creators["rtsc"] = &StrategyContext::rtsc;
@@ -182,6 +184,7 @@ private:
     static Strategy* arathi(PlayerbotAI* botAI) { return new ArathiStrategy(botAI); }
     static Strategy* eye(PlayerbotAI* botAI) { return new EyeStrategy(botAI); }
     static Strategy* isle(PlayerbotAI* botAI) { return new IsleStrategy(botAI); }
+    static Strategy* vehicle_combat(PlayerbotAI* botAI) { return new VehicleCombatStrategy(botAI); }
     static Strategy* arena(PlayerbotAI* botAI) { return new ArenaStrategy(botAI); }
     static Strategy* rtsc(PlayerbotAI* botAI) { return new RTSCStrategy(botAI); }
     static Strategy* attack_tagged(PlayerbotAI* botAI) { return new AttackTaggedStrategy(botAI); }

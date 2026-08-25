@@ -253,6 +253,8 @@ bool PlayerbotAIConfig::Initialize()
     randomBotAutologin = sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotAutologin", true);
     minRandomBots = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBots", 500);
     maxRandomBots = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBots", 500);
+    lfgMinEquippedItems = sConfigMgr->GetOption<int32>("AiPlayerbot.LfgMinEquippedItems", 10);
+    clusterTotalRandomBots = sConfigMgr->GetOption<int32>("AiPlayerbot.ClusterTotalRandomBots", 0);
     randomBotUpdateInterval = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotUpdateInterval", 20);
     randomBotCountChangeMinInterval =
         sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotCountChangeMinInterval", 30 * MINUTE);

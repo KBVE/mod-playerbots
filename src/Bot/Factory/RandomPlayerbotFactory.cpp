@@ -364,8 +364,12 @@ uint32 RandomPlayerbotFactory::CalculateTotalAccountCount()
     // Determine divisor based on Death Knight availability and requested A&H faction ratio
     int divisor = CalculateAvailableCharsPerAccount();
 
-    // Calculate max bots
-    int maxBots = sPlayerbotAIConfig.maxRandomBots;
+    // Calculate max bots. Sized for the shared pool, not this server: the
+    // accounts created here are the ones AssignAccountTypes then promotes, so
+    // if this used the local MaxRandomBots on a cluster it would create fewer
+    // accounts than there are RNDbot slots to fill and the assignment would
+    // report "Not enough unassigned accounts".
+    int maxBots = int(sPlayerbotAIConfig.GetBotPoolSizingTarget());
     // Take periodic online/offline into account
     if (sPlayerbotAIConfig.enablePeriodicOnlineOffline)
         maxBots *= sPlayerbotAIConfig.periodicOnlineOfflineRatio;

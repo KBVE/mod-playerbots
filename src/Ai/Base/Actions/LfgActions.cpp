@@ -90,6 +90,29 @@ bool LfgJoinAction::JoinLFG()
     if (state != LFG_STATE_NONE)
         return false;
 
+    // Do not queue a bot that is not wearing its gear. Bots exist whose items
+    // sit in the backpack with every equipment slot empty, and the dungeon
+    // finder is happy to hand one to a player as the tank or the healer -- a
+    // naked level 80 priest cannot heal a heroic. Observed on a live realm:
+    // roughly one in ten already-randomized bots was carrying a full set of
+    // items it had never equipped.
+    //
+    // Filtering here rather than at the matchmaking service is deliberate: the
+    // service only receives class, level and role, so this is the only place
+    // that knows whether the bot is actually dressed.
+    if (sPlayerbotAIConfig.lfgMinEquippedItems > 0)
+    {
+        uint32 equipped = 0;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                ++equipped;
+        }
+
+        if (equipped < sPlayerbotAIConfig.lfgMinEquippedItems)
+            return false;
+    }
+
     /*ItemCountByQuality visitor;
     IterateItems(&visitor, ITERATE_ITEMS_IN_EQUIP);
     bool random = urand(0, 100) < 20;

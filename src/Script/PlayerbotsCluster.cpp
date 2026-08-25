@@ -25,6 +25,10 @@
 
 #include "BattlegroundMgr.h"
 #include "CharacterCache.h"
+#include "DBCStores.h"
+#include "InstanceSaveMgr.h"
+#include "Group.h"
+#include "GroupMgr.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
@@ -51,6 +55,13 @@
 namespace
 {
     constexpr char CLUSTER_LOGIN_REQUEST_SUBJECT[] = "playerbots.login-request";
+    // Asks whichever shard currently hosts a grouped bot to send it to its
+    // master. The partition keeps a bot on the shard owning the map it is
+    // saved on, which is not necessarily the shard hosting the player who
+    // grouped it: the group forms over NATS, but the bot then sits in another
+    // process and can neither be seen nor followed. Carries the master's
+    // position so the receiving shard can teleport the bot onto it.
+    constexpr char CLUSTER_GROUP_ANCHOR_SUBJECT[] = "playerbots.group-anchor";
     constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
     constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
     constexpr char GROUP_MESSAGE_NEW_SUBJECT[] = "group.message.new";
@@ -85,6 +96,18 @@ namespace
         int32 delay;
     };
     std::vector<ClusterPendingLogin> clusterPendingLogins;
+
+    // A bot handed to another shard arrives after OnAddMember has already run
+    // everywhere, so nothing re-binds it to the master waiting in the dungeon.
+    // Re-check shortly after the login lands. World thread only.
+    struct ClusterPendingGroupBind
+    {
+        ObjectGuid::LowType guid;
+        int32 delay;
+    };
+    std::vector<ClusterPendingGroupBind> clusterPendingGroupBinds;
+    constexpr int32 CLUSTER_GROUP_BIND_DELAY_MS = 3000;
+
     bool clusterSubscribed = false;
 
     // Fed from the sidecar-query threads, drained on the world thread.
@@ -129,6 +152,173 @@ namespace
                 return;
 
         clusterPendingLogins.push_back({guidLow, mapId, int32(CLUSTER_LOGIN_DELAY_MS)});
+    }
+
+    // Where a group actually is, as seen by the shard hosting one of its real
+    // players. Broadcast on every group change and every map change, and
+    // consumed by every other shard to bring its own grouped bots along.
+    //
+    // This replaces the earlier per-bot "follow" message, which keyed off the
+    // group leader. LFG groups are routinely led by a bot, so that message was
+    // never sent for the one case it was written for.
+    struct ClusterPendingAnchor
+    {
+        ObjectGuid::LowType groupLow;
+        // Whose instance the bots belong in. TeleportTo takes no instance, so
+        // without binding to this player's save first every bot resolves its
+        // own copy of the dungeon and the master arrives alone.
+        ObjectGuid::LowType anchorLow;
+        uint32 mapId;
+        uint32 instanceId;
+        float x, y, z, o;
+        bool publish;
+        // The roster travels WITH the anchor. A group formed inside a
+        // worldserver (every LFG party) was never registered with the group
+        // service, so no other shard has it and a GetGroupByGUID lookup on the
+        // receiving side finds nothing -- the message was published into the
+        // void and the bots never came. Carrying the members makes delivery
+        // independent of whether the group was mirrored.
+        std::vector<ObjectGuid::LowType> members;
+    };
+
+    // Fed from map-update worker threads (OnMapChanged), drained on the world
+    // thread. Teleporting a player from another map's update thread is not
+    // safe, so the hook only records the anchor.
+    std::mutex clusterPendingAnchorMutex;
+    std::vector<ClusterPendingAnchor> clusterPendingAnchors;
+
+    // The group's master is whichever real player this shard can see, not the
+    // leader. GetFirstMember() walks Player objects, so it only ever yields
+    // members hosted in this process -- exactly the ones we can speak for.
+    Player* FindLocalGroupAnchor(Group* group)
+    {
+        for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+        {
+            Player* member = itr->GetSource();
+            if (!member || !member->GetSession() || member->GetSession()->IsBot())
+                continue;
+
+            return member;
+        }
+
+        return nullptr;
+    }
+
+    // Point a bot at the real player this shard hosts. Idempotent: the anchor
+    // is re-applied whenever the group moves, and a bot handed to a new shard
+    // has to be re-bound there because OnAddMember already fired elsewhere.
+    void BindBotToAnchor(Player* bot, Player* anchor, Group* group)
+    {
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI || botAI->GetMaster() == anchor)
+            return;
+
+        bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot);
+        if (!isRandomBot)
+            return;  // alt bots keep their owner
+
+        LOG_INFO("playerbots", "Cluster: bot {} now following {}", bot->GetName(), anchor->GetName());
+
+        botAI->SetMaster(anchor);
+        botAI->ResetStrategies();
+        botAI->ChangeStrategy(group->isLFGGroup() ? "+follow,-bg" : "+follow,-lfg,-bg",
+                              BOT_STATE_NON_COMBAT);
+        botAI->Reset();
+    }
+
+    void QueueGroupAnchor(Group* group, Player* anchor, bool publish)
+    {
+        if (!group || !anchor)
+            return;
+
+        ClusterPendingAnchor pending;
+        pending.groupLow = group->GetGUID().GetCounter();
+        pending.anchorLow = anchor->GetGUID().GetCounter();
+        pending.mapId = anchor->GetMapId();
+        pending.instanceId = anchor->GetInstanceId();
+        pending.x = anchor->GetPositionX();
+        pending.y = anchor->GetPositionY();
+        pending.z = anchor->GetPositionZ();
+        pending.o = anchor->GetOrientation();
+        pending.publish = publish;
+        for (auto const& slot : group->GetMemberSlots())
+            pending.members.push_back(slot.guid.GetCounter());
+
+        std::lock_guard<std::mutex> lock(clusterPendingAnchorMutex);
+        for (ClusterPendingAnchor& existing : clusterPendingAnchors)
+        {
+            if (existing.groupLow == pending.groupLow)
+            {
+                pending.publish = pending.publish || existing.publish;
+                existing = pending;
+                return;
+            }
+        }
+
+        clusterPendingAnchors.push_back(pending);
+    }
+
+    // Runs on the world thread (delivered through ProcessHooks), same as the
+    // login request above.
+    //
+    // A bot grouped by a player on another shard is invisible to that player:
+    // the group forms over NATS, but the bot stays in the process owning the
+    // map it is saved on. This teleports it onto its master instead of trying
+    // to move it between shards directly -- the destination map belongs to the
+    // master's shard, so the existing partition path (OnPlayerUpdateZone ->
+    // ProcessPendingKicks -> handoff) picks the bot up and delivers it there,
+    // and because the logout saves the new position it loads next to its
+    // master rather than back where it started. One transport, not two.
+    void OnClusterGroupAnchor(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        uint32 groupLow = 0;
+        uint32 anchorLow = 0;
+        uint32 mapId = 0;
+        uint32 instanceId = 0;
+        float x = 0.f, y = 0.f, z = 0.f, o = 0.f;
+        std::string data(payload, payloadLen);
+        if (sscanf(data.c_str(), "{\"gg\":%u,\"a\":%u,\"m\":%u,\"i\":%u,\"x\":%f,\"y\":%f,\"z\":%f,\"o\":%f}",
+                   &groupLow, &anchorLow, &mapId, &instanceId, &x, &y, &z, &o) != 8)
+            return;
+
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        ClusterPendingAnchor pending;
+        pending.groupLow = groupLow;
+        pending.anchorLow = anchorLow;
+        pending.mapId = mapId;
+        pending.instanceId = instanceId;
+        pending.x = x;
+        pending.y = y;
+        pending.z = z;
+        pending.o = o;
+        pending.publish = false;
+
+        // Deliberately no GetGroupByGUID guard: an LFG group exists only in
+        // the worldserver that built it, so requiring a local group here threw
+        // the message away on exactly the shards holding the bots.
+        if (size_t const memPos = data.find("\"mem\":"); memPos != std::string::npos)
+        {
+            char const* cursor = data.c_str() + memPos + 6;
+            while (*cursor)
+            {
+                char* end = nullptr;
+                unsigned long const guid = strtoul(cursor, &end, 10);
+                if (end == cursor)
+                    break;
+
+                if (guid)
+                    pending.members.push_back(ObjectGuid::LowType(guid));
+
+                cursor = (*end == ',') ? end + 1 : end;
+                if (*end != ',')
+                    break;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(clusterPendingAnchorMutex);
+        clusterPendingAnchors.push_back(pending);
     }
 
     // Minimal extractor for one numeric field of the groupserver JSON events
@@ -664,8 +854,31 @@ class PlayerbotsClusterPlayerScript : public PlayerScript
 public:
     PlayerbotsClusterPlayerScript() : PlayerScript("PlayerbotsClusterPlayerScript", {
         PLAYERHOOK_ON_UPDATE_ZONE,
-        PLAYERHOOK_ON_BEFORE_TELEPORT
+        PLAYERHOOK_ON_BEFORE_TELEPORT,
+        PLAYERHOOK_ON_MAP_CHANGED
     }) {}
+
+    // A real player changing map is the only reliable signal that a group has
+    // moved somewhere its bots are not. LFG dungeon entry is the case that
+    // matters: LFGMgr teleports the members it can resolve locally and skips
+    // everyone else, so on a partitioned cluster the human lands in the
+    // instance alone. Record the anchor; the world thread does the work.
+    //
+    // May run on map-update worker threads: only collect, never act here.
+    void OnPlayerMapChanged(Player* player) override
+    {
+        if (!sToCloud9Sidecar->ClusterModeEnabled() || !sPlayerbotAIConfig.enabled)
+            return;
+
+        if (!player->GetSession() || player->GetSession()->IsBot())
+            return;
+
+        if (player->InBattleground())
+            return;  // matchmaking owns BG membership (C-BG.5)
+
+        if (Group* group = player->GetGroup())
+            QueueGroupAnchor(group, player, true);
+    }
 
     // A random bot pulled out of a running battleground shrinks its team below
     // MinPlayersPerTeam and AC ends the match "not enough players" (observed:
@@ -727,6 +940,7 @@ public:
         if (!clusterSubscribed && sPlayerbotAIConfig.enabled)
             clusterSubscribed =
                 sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest) &&
+                sToCloud9Sidecar->NatsSubscribe(CLUSTER_GROUP_ANCHOR_SUBJECT, &OnClusterGroupAnchor) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage) &&
@@ -737,8 +951,10 @@ public:
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_EXPIRED_SUBJECT, &OnClusterBGInviteExpired);
 
         UpdateCooldowns(diff);
+        ProcessPendingAnchors();
         ProcessPendingKicks();
         ProcessPendingLogins(diff);
+        ProcessPendingGroupBinds(diff);
         ProcessPendingBGJoins(diff);
     }
 
@@ -761,6 +977,131 @@ private:
                 itr = clusterBGQueuedBots.erase(itr);
             else
                 ++itr;
+        }
+    }
+
+    void ProcessPendingAnchors()
+    {
+        std::vector<ClusterPendingAnchor> anchors;
+        {
+            std::lock_guard<std::mutex> lock(clusterPendingAnchorMutex);
+            if (clusterPendingAnchors.empty())
+                return;
+
+            anchors.swap(clusterPendingAnchors);
+        }
+
+        for (ClusterPendingAnchor const& anchor : anchors)
+        {
+            Group* group = sGroupMgr->GetGroupByGUID(anchor.groupLow);
+
+            if (anchor.publish)
+            {
+                std::string payload = "{\"gg\":" + std::to_string(anchor.groupLow) +
+                                      ",\"a\":" + std::to_string(anchor.anchorLow) +
+                                      ",\"m\":" + std::to_string(anchor.mapId) +
+                                      ",\"i\":" + std::to_string(anchor.instanceId);
+                char pos[96];
+                snprintf(pos, sizeof(pos), ",\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"o\":%.3f",
+                         anchor.x, anchor.y, anchor.z, anchor.o);
+                payload += pos;
+                payload += ",\"mem\":";
+                for (size_t i = 0; i < anchor.members.size(); ++i)
+                    payload += (i ? "," : "") + std::to_string(anchor.members[i]);
+                payload += "}";
+
+                sToCloud9Sidecar->NatsPublish(CLUSTER_GROUP_ANCHOR_SUBJECT, payload);
+            }
+
+            MoveLocalGroupBots(group, anchor);
+        }
+    }
+
+    // The core only teleports the members it can see: LFGMgr skips anyone
+    // ObjectAccessor::FindConnectedPlayer cannot resolve, and a portal or
+    // hearthstone moves the player alone in the first place. Bring the bots
+    // this shard owns to wherever the anchor ended up.
+    void MoveLocalGroupBots(Group* group, ClusterPendingAnchor const& anchor)
+    {
+        // Prefer the roster carried by the anchor: on a shard that never saw
+        // the group created, it is the only member list available. Fall back
+        // to the local group for anchors raised in this process.
+        std::vector<ObjectGuid::LowType> members = anchor.members;
+        if (members.empty() && group)
+            for (auto const& slot : group->GetMemberSlots())
+                members.push_back(slot.guid.GetCounter());
+
+        Player* localAnchor = group ? FindLocalGroupAnchor(group) : nullptr;
+
+        // ClusterAnchorTrace: one line per member per anchor event, INFO so it
+        // reaches the log pipeline. Every branch below used to be a silent
+        // continue, which made a bot that never followed its party
+        // indistinguishable from one that was never considered. Volume is
+        // bounded by group moves, not by bot count.
+        for (ObjectGuid::LowType memberLow : members)
+        {
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(memberLow));
+            if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+            {
+                // Not loaded here, or a real player. A bot mid-handoff when the
+                // anchor fires lands in this branch and is never retried.
+                LOG_INFO("playerbots",
+                         "ClusterAnchorTrace group={} member={} decision={} dstMap={} dstInst={}",
+                         anchor.groupLow, memberLow,
+                         !bot ? "absent_from_process" : (bot->GetSession() ? "real_player" : "no_session"),
+                         anchor.mapId, anchor.instanceId);
+                continue;
+            }
+
+            if (bot->InBattleground())
+            {
+                LOG_INFO("playerbots",
+                         "ClusterAnchorTrace group={} member={} bot={} decision=in_battleground srcMap={} dstMap={}",
+                         anchor.groupLow, memberLow, bot->GetName(), bot->GetMapId(), anchor.mapId);
+                continue;  // BG participants stay with their match (C-BG.5)
+            }
+
+            if (localAnchor && group)
+                BindBotToAnchor(bot, localAnchor, group);
+
+            if (bot->GetMapId() == anchor.mapId && bot->GetInstanceId() == anchor.instanceId)
+            {
+                LOG_INFO("playerbots",
+                         "ClusterAnchorTrace group={} member={} bot={} decision=already_there map={} inst={}",
+                         anchor.groupLow, memberLow, bot->GetName(), anchor.mapId, anchor.instanceId);
+                continue;
+            }
+
+            // TeleportTo carries no instance, so bind the bot to the anchor's
+            // save first -- otherwise the map is right, the copy is not, and
+            // the master stands in an empty dungeon while the bots fight in
+            // their own. Only possible while the anchor's save lives in this
+            // process; across shards the instance cannot be shared at all.
+            if (anchor.instanceId && anchor.anchorLow)
+            {
+                ObjectGuid const anchorGuid = ObjectGuid::Create<HighGuid::Player>(anchor.anchorLow);
+                MapEntry const* mapEntry = sMapStore.LookupEntry(anchor.mapId);
+                Difficulty const difficulty = (mapEntry && mapEntry->IsRaid())
+                    ? bot->GetRaidDifficulty() : bot->GetDungeonDifficulty();
+
+                if (InstanceSave* save = sInstanceSaveMgr->PlayerGetInstanceSave(anchorGuid, anchor.mapId, difficulty))
+                    sInstanceSaveMgr->PlayerBindToInstance(bot->GetGUID(), save, false, bot);
+            }
+
+            bool const bound = anchor.instanceId == 0 || bot->GetInstanceId() == anchor.instanceId;
+            LOG_INFO("playerbots",
+                     "ClusterAnchorTrace group={} member={} bot={} decision=teleport srcMap={} srcInst={} dstMap={} dstInst={} bound={}",
+                     anchor.groupLow, memberLow, bot->GetName(), bot->GetMapId(), bot->GetInstanceId(),
+                     anchor.mapId, anchor.instanceId, bound ? 1 : 0);
+
+            bool const sent = bot->TeleportTo(anchor.mapId, anchor.x, anchor.y, anchor.z, anchor.o);
+
+            // TeleportTo returning false is the case that would explain a bot
+            // the anchor claims to have moved still sitting on its old map.
+            LOG_INFO("playerbots",
+                     "ClusterAnchorTrace group={} member={} bot={} decision=teleport_result accepted={} nowMap={} nowInst={}",
+                     anchor.groupLow, memberLow, bot->GetName(), sent ? 1 : 0,
+                     bot->GetMapId(), bot->GetInstanceId());
         }
     }
 
@@ -791,9 +1132,92 @@ private:
             if (bot->InBattleground())
                 continue;  // BG participants stay with their match (C-BG.5)
 
+            // Never evict a bot that is standing with its master. The
+            // partition governs where bots GRIND, not where a group may be:
+            // a dungeon map belongs to the instance shard, but a real player
+            // entering it is not partitioned and stays in whichever process
+            // they were already in. The bot followed them there correctly,
+            // and kicking it off the master's own map is what left players
+            // alone in dungeons -- the group anchor delivered the bot and
+            // this loop threw it straight back out.
+            //
+            // Position is deliberately NOT compared. Both earlier attempts
+            // (instance equality, then map equality) tried to prove the bot
+            // was already beside its master, and both lost the same race:
+            // LFGMgr teleports members out of an unordered set and TeleportTo
+            // is asynchronous, so a bot reaches the dungeon and fires its zone
+            // update while the player is still in flight. The partition then
+            // evicted the party a moment before the master landed.
+            //
+            // A grouped bot follows its master, not the partition -- the same
+            // rule the alt-bot check above already applies. Where the group
+            // should be is the anchor's business; this loop only decides where
+            // UNGROUPED bots may grind.
+            if (Group* group = bot->GetGroup())
+            {
+                bool groupHasRealPlayer = false;
+                for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+                {
+                    Player* member = itr->GetSource();
+                    if (member && member->GetSession() && !member->GetSession()->IsBot())
+                    {
+                        groupHasRealPlayer = true;
+                        break;
+                    }
+                }
+
+                // Members hosted on other shards have no local Player, so fall
+                // back to the roster: anyone the bot pool does not own is a
+                // real player as far as this decision goes.
+                if (!groupHasRealPlayer)
+                {
+                    for (auto const& slot : group->GetMemberSlots())
+                    {
+                        if (!sRandomPlayerbotMgr.IsRandomBot(slot.guid.GetCounter()))
+                        {
+                            groupHasRealPlayer = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (groupHasRealPlayer)
+                {
+                    if (Player* anchor = FindLocalGroupAnchor(group))
+                    {
+                        // Master is here, so the anchor decides where the bot
+                        // goes and the partition must keep its hands off.
+                        if (anchor->GetMapId() != bot->GetMapId() ||
+                            anchor->GetInstanceId() != bot->GetInstanceId())
+                            QueueGroupAnchor(group, anchor, false);
+
+                        continue;
+                    }
+
+                    // No local anchor means the master is on another shard, and
+                    // the bot has already teleported onto a map this one does
+                    // not own -- its own private copy of the master's dungeon,
+                    // which the master can never see. Exempting it here strands
+                    // it there forever, because the handoff below is the only
+                    // thing that can deliver it to the shard actually running
+                    // that instance. Fall through: the followingMaster branch
+                    // already hands grouped bots off rather than
+                    // re-randomizing them.
+                }
+            }
+
             clusterKickCooldowns[guid.GetCounter()] = int32(CLUSTER_KICK_COOLDOWN_MS);
 
-            if (IsMapServedByClusterBots(mapId))
+            // A grouped bot is always handed off, never re-randomized. It got
+            // here by following its master -- through the area trigger relay
+            // into a dungeon, most often -- and instance maps are not in
+            // ClusterBotMaps, so the re-randomize branch below would drag it
+            // back to its grind continent the moment the group zoned in. The
+            // shard owning the destination accepts the handoff regardless of
+            // whether it hosts a bot pool for that map.
+            bool const followingMaster = bot->GetGroup() != nullptr;
+
+            if (followingMaster || IsMapServedByClusterBots(mapId))
             {
                 // Logout first so the receiving worldserver loads the
                 // position saved on the destination map.
@@ -824,6 +1248,29 @@ private:
     // in-process bot whose BG runs on THIS shard: AddPlayersToBattleground
     // equivalent (entry point + bg id + teleport) then joined confirmation,
     // plus the playerbots force-join state (BattleGroundJoinAction mirror).
+    void ProcessPendingGroupBinds(uint32 diff)
+    {
+        for (auto itr = clusterPendingGroupBinds.begin(); itr != clusterPendingGroupBinds.end();)
+        {
+            itr->delay -= int32(diff);
+            if (itr->delay > 0)
+            {
+                ++itr;
+                continue;
+            }
+
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(itr->guid));
+            if (bot && bot->GetSession() && bot->GetSession()->IsBot())
+            {
+                if (Group* group = bot->GetGroup())
+                    if (Player* anchor = FindLocalGroupAnchor(group))
+                        QueueGroupAnchor(group, anchor, false);
+            }
+
+            itr = clusterPendingGroupBinds.erase(itr);
+        }
+    }
+
     void ProcessPendingBGJoins(uint32 diff)
     {
         std::vector<ClusterPendingBGJoin> joins;
@@ -926,6 +1373,7 @@ private:
             {
                 LOG_INFO("playerbots", "Cluster: logging in handed-off bot guid {} for map {}", itr->guid, itr->mapId);
                 sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+                clusterPendingGroupBinds.push_back({itr->guid, int32(CLUSTER_GROUP_BIND_DELAY_MS)});
             }
 
             itr = clusterPendingLogins.erase(itr);
@@ -1014,35 +1462,56 @@ public:
         if (!sPlayerbotAIConfig.enabled || !sToCloud9Sidecar->ClusterModeEnabled())
             return;
 
+        // Whichever real player this shard hosts speaks for the group. The
+        // previous version keyed on the group leader and bailed when it was a
+        // bot, which is the normal shape of an LFG group -- so none of this
+        // ran for the case it was written for.
+        Player* anchor = FindLocalGroupAnchor(group);
+
         Player* bot = ObjectAccessor::FindPlayer(guid);
-        if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+
+        // The member is not in this process. If we host a real player from the
+        // group, tell the shard that does host it where to send it. Without
+        // this the group forms (member.added reaches every shard over NATS)
+        // but the player is left alone, which is indistinguishable from the
+        // bots simply not working.
+        if (!bot)
+        {
+            if (anchor)
+                QueueGroupAnchor(group, anchor, true);
+
             return;
+        }
+
+        // A real player joined a group we host. Broadcast where they are so
+        // the shards holding the other members bring them over.
+        if (!bot->GetSession() || !bot->GetSession()->IsBot())
+        {
+            QueueGroupAnchor(group, bot, true);
+            return;
+        }
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
         if (!botAI)
             return;
 
-        // Only obey a real player hosted on this shard: bot-led groups keep
-        // the vanilla behavior, and a cross-shard leader has no local Player
-        // to follow anyway.
-        Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
-        if (!leader || leader == bot || GET_PLAYERBOT_AI(leader))
+        // No real player here: either the group is all bots (vanilla
+        // behaviour) or the human is on another shard and will send an anchor.
+        if (!anchor || anchor == bot)
             return;
 
-        bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot);
-        if (!isRandomBot && botAI->GetMaster() != leader)
-            return;  // alt bots only follow their owner
-
-        LOG_INFO("playerbots", "Cluster: bot {} grouped with {}, switching to follow", bot->GetName(), leader->GetName());
-
         // Alt bots keep their owner as master (vanilla AcceptInvitationAction
-        // only rebinds the master for random bots).
-        if (isRandomBot)
-            botAI->SetMaster(leader);
-        botAI->ResetStrategies();
-        botAI->ChangeStrategy("+follow,-lfg,-bg", BOT_STATE_NON_COMBAT);
-        botAI->Reset();
+        // only rebinds the master for random bots), so BindBotToAnchor is a
+        // no-op for them unless the anchor already is their owner.
+        if (!sRandomPlayerbotMgr.IsRandomBot(bot) && botAI->GetMaster() != anchor)
+            return;
+
+        BindBotToAnchor(bot, anchor, group);
         botAI->TellMaster("Hello");
+
+        // The bot is with us but the group may already be somewhere else (the
+        // human joined, then zoned). Re-broadcast so it catches up.
+        QueueGroupAnchor(group, anchor, true);
     }
 
     // A client "disband" is a Leave of the player (WoW semantics): the group

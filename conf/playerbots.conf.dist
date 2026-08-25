@@ -88,6 +88,15 @@ AiPlayerbot.RandomBotAutologin = 1
 AiPlayerbot.MinRandomBots = 500
 AiPlayerbot.MaxRandomBots = 500
 
+#    AiPlayerbot.ClusterTotalRandomBots
+#        Total random bots across ALL worldservers sharing one playerbots
+#        database. Only used to size the shared account pool; the number of
+#        bots this server logs in still comes from Min/MaxRandomBots.
+#        Leave 0 on a single server.
+#        Default: 0 (disabled)
+
+AiPlayerbot.ClusterTotalRandomBots = 0
+
 # Randombot accounts
 # Set to 0 to automatically calculate needed accounts based on MaxRandomBots, EnablePeriodicOnlineOffline
 # and its ratio, and AddClassAccountPoolSize. Set manually if you want to create more accounts than needed.

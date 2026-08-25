@@ -155,6 +155,16 @@ public:
     float randomBotMinLevelChance, randomBotMaxLevelChance;
     float randomBotRpgChance;
     uint32 minRandomBots, maxRandomBots;
+    uint32 clusterTotalRandomBots;
+
+    // Population the SHARED account pool must serve. Every worldserver on one
+    // playerbots database sizes that pool, so on a cluster it has to be the
+    // fleet-wide figure rather than this server's own MaxRandomBots. Does not
+    // affect how many bots this server logs in.
+    uint32 GetBotPoolSizingTarget() const
+    {
+        return clusterTotalRandomBots > 0 ? clusterTotalRandomBots : maxRandomBots;
+    }
     uint32 randomBotUpdateInterval, randomBotCountChangeMinInterval, randomBotCountChangeMaxInterval;
     uint32 minRandomBotInWorldTime, maxRandomBotInWorldTime;
     uint32 minRandomBotRandomizeTime, maxRandomBotRandomizeTime;

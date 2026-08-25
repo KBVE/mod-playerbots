@@ -155,6 +155,7 @@ public:
     float randomBotMinLevelChance, randomBotMaxLevelChance;
     float randomBotRpgChance;
     uint32 minRandomBots, maxRandomBots;
+    uint32 lfgMinEquippedItems;
     uint32 clusterTotalRandomBots;
 
     // Population the SHARED account pool must serve. Every worldserver on one

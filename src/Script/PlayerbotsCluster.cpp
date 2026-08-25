@@ -1033,20 +1033,44 @@ private:
 
         Player* localAnchor = group ? FindLocalGroupAnchor(group) : nullptr;
 
+        // ClusterAnchorTrace: one line per member per anchor event, INFO so it
+        // reaches the log pipeline. Every branch below used to be a silent
+        // continue, which made a bot that never followed its party
+        // indistinguishable from one that was never considered. Volume is
+        // bounded by group moves, not by bot count.
         for (ObjectGuid::LowType memberLow : members)
         {
             Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(memberLow));
             if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
-                continue;  // not in this process, or a real player
+            {
+                // Not loaded here, or a real player. A bot mid-handoff when the
+                // anchor fires lands in this branch and is never retried.
+                LOG_INFO("playerbots",
+                         "ClusterAnchorTrace group={} member={} decision={} dstMap={} dstInst={}",
+                         anchor.groupLow, memberLow,
+                         !bot ? "absent_from_process" : (bot->GetSession() ? "real_player" : "no_session"),
+                         anchor.mapId, anchor.instanceId);
+                continue;
+            }
 
             if (bot->InBattleground())
+            {
+                LOG_INFO("playerbots",
+                         "ClusterAnchorTrace group={} member={} bot={} decision=in_battleground srcMap={} dstMap={}",
+                         anchor.groupLow, memberLow, bot->GetName(), bot->GetMapId(), anchor.mapId);
                 continue;  // BG participants stay with their match (C-BG.5)
+            }
 
             if (localAnchor && group)
                 BindBotToAnchor(bot, localAnchor, group);
 
             if (bot->GetMapId() == anchor.mapId && bot->GetInstanceId() == anchor.instanceId)
+            {
+                LOG_INFO("playerbots",
+                         "ClusterAnchorTrace group={} member={} bot={} decision=already_there map={} inst={}",
+                         anchor.groupLow, memberLow, bot->GetName(), anchor.mapId, anchor.instanceId);
                 continue;
+            }
 
             // TeleportTo carries no instance, so bind the bot to the anchor's
             // save first -- otherwise the map is right, the copy is not, and
@@ -1064,10 +1088,20 @@ private:
                     sInstanceSaveMgr->PlayerBindToInstance(bot->GetGUID(), save, false, bot);
             }
 
-            LOG_INFO("playerbots", "Cluster: group anchor moves bot {} to map {} instance {}",
-                     bot->GetName(), anchor.mapId, anchor.instanceId);
+            bool const bound = anchor.instanceId == 0 || bot->GetInstanceId() == anchor.instanceId;
+            LOG_INFO("playerbots",
+                     "ClusterAnchorTrace group={} member={} bot={} decision=teleport srcMap={} srcInst={} dstMap={} dstInst={} bound={}",
+                     anchor.groupLow, memberLow, bot->GetName(), bot->GetMapId(), bot->GetInstanceId(),
+                     anchor.mapId, anchor.instanceId, bound ? 1 : 0);
 
-            bot->TeleportTo(anchor.mapId, anchor.x, anchor.y, anchor.z, anchor.o);
+            bool const sent = bot->TeleportTo(anchor.mapId, anchor.x, anchor.y, anchor.z, anchor.o);
+
+            // TeleportTo returning false is the case that would explain a bot
+            // the anchor claims to have moved still sitting on its old map.
+            LOG_INFO("playerbots",
+                     "ClusterAnchorTrace group={} member={} bot={} decision=teleport_result accepted={} nowMap={} nowInst={}",
+                     anchor.groupLow, memberLow, bot->GetName(), sent ? 1 : 0,
+                     bot->GetMapId(), bot->GetInstanceId());
         }
     }
 

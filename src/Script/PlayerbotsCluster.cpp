@@ -1033,11 +1033,42 @@ private:
 
         Player* localAnchor = group ? FindLocalGroupAnchor(group) : nullptr;
 
+        // The anchor event is broadcast to every worldserver, so the shard that
+        // owns none of the group would otherwise log absent_from_process once
+        // per member on every event -- pure noise that buries the case worth
+        // seeing. Measured on a live two-shard realm: 8 such lines against 11
+        // real decisions. Say it once and stop.
+        bool anyLocal = false;
+        for (ObjectGuid::LowType memberLow : members)
+        {
+            if (Player* p = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(memberLow)))
+            {
+                if (p->GetSession())
+                {
+                    anyLocal = true;
+                    break;
+                }
+            }
+        }
+
+        if (!anyLocal)
+        {
+            LOG_INFO("playerbots",
+                     "ClusterAnchorTrace group={} decision=not_this_shard members={} dstMap={} dstInst={}",
+                     anchor.groupLow, uint32(members.size()), anchor.mapId, anchor.instanceId);
+            return;
+        }
+
         // ClusterAnchorTrace: one line per member per anchor event, INFO so it
         // reaches the log pipeline. Every branch below used to be a silent
         // continue, which made a bot that never followed its party
         // indistinguishable from one that was never considered. Volume is
         // bounded by group moves, not by bot count.
+        //
+        // absent_from_process below now means something specific: this shard
+        // holds part of the group but not this member. That is the bot mid
+        // handoff -- skipped with no retry -- rather than a member that simply
+        // lives on the other shard.
         for (ObjectGuid::LowType memberLow : members)
         {
             Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(memberLow));

@@ -484,7 +484,8 @@ public:
     bool isPossible() override;
 
 private:
-    uint32 PickSpell();
+    Unit* PickTarget();
+    uint32 PickSpell(Unit* target);
 };
 
 class MainTankActionNameSupport

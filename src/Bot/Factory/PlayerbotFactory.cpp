@@ -41,6 +41,23 @@
 #include "AiObjectContext.h"
 #include "ItemPackets.h"
 
+// Equipment slots that carry no stats: a bot wearing only a shirt or a tabard is
+// naked for every purpose that matters here.
+static uint32 CountEquippedGear(Player* bot)
+{
+    uint32 count = 0;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        if (slot == EQUIPMENT_SLOT_BODY || slot == EQUIPMENT_SLOT_TABARD)
+            continue;
+
+        if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            ++count;
+    }
+
+    return count;
+}
+
 const uint64 diveMask = (1LL << 7) | (1LL << 44) | (1LL << 37) | (1LL << 38) | (1LL << 26) | (1LL << 30) | (1LL << 27) |
                         (1LL << 33) | (1LL << 24) | (1LL << 34);
 
@@ -737,8 +754,21 @@ void PlayerbotFactory::Randomize(bool incremental)
 
     pmo = sPerfMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Equip");
     LOG_DEBUG("playerbots", "Initializing equipmemt...");
+    // Persistence means "keep the gear this bot already has", but it never asked
+    // whether the bot has any. A bot that lost its equipment was therefore
+    // preserved in that state on every subsequent randomization, and since
+    // AutoUpgradeEquip only fires on levelup, a max-level bot could never
+    // recover -- naked became an absorbing state. Observed on a live realm:
+    // 92 level 80 bots stripped for four days, one re-randomized three hours
+    // earlier and still wearing nothing.
+    //
+    // The threshold rather than a simple emptiness test is deliberate. Bots turned
+    // up holding a single trinket, or one pair of bracers, or nothing but a shirt;
+    // all of those pass an "is anything equipped" check and would have stayed
+    // broken.
     if (!incremental || !sPlayerbotAIConfig.equipAndSpecPersistence ||
-        bot->GetLevel() < sPlayerbotAIConfig.equipAndSpecPersistenceLevel)
+        bot->GetLevel() < sPlayerbotAIConfig.equipAndSpecPersistenceLevel ||
+        int32(CountEquippedGear(bot)) < sPlayerbotAIConfig.equipPersistenceMinItems)
     {
         InitEquipment(incremental, incremental ? false : sPlayerbotAIConfig.twoRoundsGearInit);
     }

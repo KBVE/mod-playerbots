@@ -416,6 +416,7 @@ public:
     bool downgradeMaxLevelBot;
     bool equipAndSpecPersistence;
     int32 equipAndSpecPersistenceLevel;
+    int32 equipPersistenceMinItems;
     int32 groupInvitationPermission;
     bool keepAltsInGroup = false;
     bool KeepAltsInGroup() const { return keepAltsInGroup; }

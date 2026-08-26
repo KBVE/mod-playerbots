@@ -99,6 +99,7 @@ public:
     bool EnableICCBuffs;
     bool allowAccountBots, allowGuildBots, allowTrustedAccountBots;
     bool randomBotGuildNearby, randomBotInvitePlayer, inviteChat;
+    float vehicleFlightClearance;
     uint32 globalCoolDown, reactDelay, maxWaitForMove, disableMoveSplinePath, expireActionTime,
         dispelAuraDuration, passiveDelay, repeatDelay, errorDelay, rpgDelay, sitDelay, returnDelay, lootDelay;
     bool dynamicReactDelay;

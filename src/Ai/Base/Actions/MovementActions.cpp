@@ -399,6 +399,19 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool /*idle
         if (!vehicleBase || !seat || !seat->CanControl())  // is passenger and cant move anyway
             return false;
 
+        // Every caller hands us a ground-level Z -- an enemy's position, a
+        // follow offset already clamped by UpdateAllowedPositionZ, a grind
+        // spot. A flying vehicle told to fly there skims the terrain and
+        // cannot clear anything between it and the target. Lift the
+        // destination clear of the ground under it, and never below the
+        // altitude already held, so a climb is not undone by the next order.
+        if (vehicleBase->CanFly() && sPlayerbotAIConfig.vehicleFlightClearance > 0.0f)
+        {
+            float ground = vehicleBase->GetMapWaterOrGroundLevel(x, y, z);
+            z = std::max(z, ground + sPlayerbotAIConfig.vehicleFlightClearance);
+            z = std::max(z, vehicleBase->GetPositionZ());
+        }
+
         float distance = vehicleBase->GetExactDist(x, y, z);  // use vehicle distance, not bot
         if (distance > 0.01f)
         {

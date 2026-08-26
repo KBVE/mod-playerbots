@@ -373,6 +373,18 @@ AiPlayerbot.MaxWaitForMove = 5000
 #          2 - MoveSplinePath disabled everywhere
 AiPlayerbot.DisableMoveSplinePath = 0
 
+#
+#    AiPlayerbot.VehicleFlightClearance
+#        Description: Minimum height a bot-piloted flying vehicle keeps above the ground
+#                     under its destination. Movement callers supply ground-level
+#                     coordinates, so without this a flying vehicle skims the terrain.
+#                     Set to 0 to disable and restore the old behaviour.
+#        Default:     15
+#
+
+AiPlayerbot.VehicleFlightClearance = 15
+
+
 # Action expiration time
 AiPlayerbot.ExpireActionTime = 5000
 

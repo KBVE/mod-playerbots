@@ -494,8 +494,42 @@ bool CastVehicleSpellAction::isPossible()
 
 bool CastVehicleSpellAction::isUseful() { return botAI->IsInVehicle(false, true); }
 
-uint32 CastVehicleAttackAction::PickSpell()
+Unit* CastVehicleAttackAction::PickTarget()
 {
+    if (Unit* target = GetTarget())
+        if (botAI->IsValidUnit(target))
+            return target;
+
+    Unit* vehicleBase = bot->GetVehicleBase();
+    if (!vehicleBase)
+        return nullptr;
+
+    Unit* closest = nullptr;
+    float closestDistance = 0.0f;
+
+    GuidVector possible = AI_VALUE(GuidVector, "possible targets");
+    for (ObjectGuid const& guid : possible)
+    {
+        Unit* unit = botAI->GetUnit(guid);
+        if (!unit || !botAI->IsValidUnit(unit))
+            continue;
+
+        float distance = vehicleBase->GetExactDist(unit);
+        if (!closest || distance < closestDistance)
+        {
+            closest = unit;
+            closestDistance = distance;
+        }
+    }
+
+    return closest;
+}
+
+uint32 CastVehicleAttackAction::PickSpell(Unit* target)
+{
+    if (!target)
+        return 0;
+
     Vehicle* vehicle = bot->GetVehicle();
     if (!vehicle)
         return 0;
@@ -510,10 +544,6 @@ uint32 CastVehicleAttackAction::PickSpell()
 
     Creature* creature = vehicleBase->ToCreature();
     if (!creature)
-        return 0;
-
-    Unit* target = GetTarget();
-    if (!target)
         return 0;
 
     for (uint32 x = 0; x < MAX_CREATURE_SPELLS; ++x)
@@ -533,12 +563,17 @@ uint32 CastVehicleAttackAction::PickSpell()
     return 0;
 }
 
-bool CastVehicleAttackAction::isPossible() { return PickSpell() != 0; }
+bool CastVehicleAttackAction::isPossible() { return PickSpell(PickTarget()) != 0; }
 
 bool CastVehicleAttackAction::Execute(Event /*event*/)
 {
-    uint32 spellId = PickSpell();
-    return spellId && botAI->CastVehicleSpell(spellId, GetTarget());
+    Unit* target = PickTarget();
+    uint32 spellId = PickSpell(target);
+    if (!spellId)
+        return false;
+
+    context->GetValue<Unit*>("current target")->Set(target);
+    return botAI->CastVehicleSpell(spellId, target);
 }
 
 bool CastVehicleSpellAction::Execute(Event /*event*/)

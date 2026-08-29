@@ -43,7 +43,7 @@
 
 // Equipment slots that carry no stats: a bot wearing only a shirt or a tabard is
 // naked for every purpose that matters here.
-static uint32 CountEquippedGear(Player* bot)
+uint32 PlayerbotFactory::CountEquippedGear(Player* bot)
 {
     uint32 count = 0;
     for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)

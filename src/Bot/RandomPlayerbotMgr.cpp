@@ -1494,6 +1494,27 @@ bool RandomPlayerbotMgr::ProcessBot(Player* bot)
     if (!botAI)
         return false;
 
+    // Randomization is the only thing that re-equips a bot, and it is gated on the
+    // bot being idle and out of the battleground queue -- a battleground regular is
+    // never either, so a bot that lost its gear stayed stripped for good. The
+    // persistence fix taught the factory to notice an empty bot; this is what makes
+    // that notice reachable for the bots it was written for.
+    if (sPlayerbotAIConfig.equipPersistenceMinItems > 0 && !bot->IsInCombat() &&
+        int32(PlayerbotFactory::CountEquippedGear(bot)) < sPlayerbotAIConfig.equipPersistenceMinItems)
+    {
+        uint32 gearRescueBotId = bot->GetGUID().GetCounter();
+        // One attempt an hour: InitEquipment can legitimately come up empty for a
+        // class/level with no candidate items, and an ungated retry would re-roll
+        // the bot on every pass.
+        if (!GetEventValue(gearRescueBotId, "gearrescue"))
+        {
+            SetEventValue(gearRescueBotId, "gearrescue", 1, 3600);
+            LOG_INFO("playerbots", "Bot {} is missing equipment, re-equipping.", bot->GetName().c_str());
+            PlayerbotFactory factory(bot, bot->GetLevel());
+            factory.InitEquipment(false);
+        }
+    }
+
     if (bot->InBattleground())
         return false;
 

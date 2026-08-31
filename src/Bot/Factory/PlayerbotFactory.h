@@ -74,6 +74,7 @@ public:
     void InitPet();
     void InitAmmo();
     static uint32 CalcMixedGearScore(uint32 gs, uint32 quality);
+    static uint32 CountEquippedGear(Player* bot);
     void InitPetTalents();
     void CleanupConsumables();
     void InitReagents();
